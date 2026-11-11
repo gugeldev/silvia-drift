@@ -2,6 +2,8 @@
 
 Jogo de drift no navegador feito com [three.js](https://threejs.org/), em um único `index.html`. Sem build, sem dependências para instalar.
 
+**▶ Jogar: https://gugeldev.github.io/silvia-drift/**
+
 - Nissan Silvia S15 (drift) e Skyline R34 (carro de rua), cada um com som de motor próprio
 - Física de drift com assistência estilo arcade (ou simulação pura, nas configurações)
 - Pistas geradas com checkpoints, voltas cronometradas, parciais e fantasma da melhor volta
