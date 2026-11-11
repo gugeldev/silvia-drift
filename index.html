@@ -16,6 +16,10 @@
     padding: 6px 10px; font-size: 13px; cursor: pointer;
   }
   #hud button:hover { background: #f0f0f0; }
+  #hud select { border: 1px solid #ccc; background: #fff; color: #333; border-radius: 6px; padding: 6px; font-size: 13px; }
+  #hud { flex-wrap: wrap; max-width: calc(100vw - 420px); }
+  #rideRow { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  #rideRow input { flex: 1; accent-color: #f4631a; }
   #dash {
     position: fixed; right: 16px; bottom: 16px; width: min(360px, calc(100vw - 32px)); box-sizing: border-box;
     background: rgba(20,20,24,0.86); color: #eee; border-radius: 12px; padding: 12px 14px; font-size: 13px; user-select: none;
@@ -47,7 +51,12 @@
 <body>
 <div id="hud">
   <button id="rot">⏸ girar</button>
-  <span>arraste para orbitar · scroll para zoom</span>
+  <select id="viewSel" title="câmera (teclas 1-7)">
+    <option value="front">1 · frente ¾</option><option value="side">2 · lateral</option><option value="rear">3 · traseira ¾</option>
+    <option value="exhaust">4 · escape</option><option value="top">5 · de cima</option><option value="cockpit">6 · interior</option><option value="wheel">7 · roda</option>
+  </select>
+  <button id="lightBtn">💡 faróis</button>
+  <button id="nightBtn">🌙 noite</button>
 </div>
 <div id="dash">
   <div id="tach"><div id="tachFill"></div><div id="redline"></div></div>
@@ -59,14 +68,17 @@
     <button id="brakeBtn" disabled>freio</button>
     <button id="gasBtn" disabled>ACELERAR</button>
   </div>
-  <div id="help">segure <kbd>W</kbd>/<kbd>↑</kbd>/<kbd>espaço</kbd> para acelerar · <kbd>S</kbd>/<kbd>↓</kbd> freio · <kbd>N</kbd> ponto morto</div>
+  <label id="rideRow">altura <input type="range" id="ride" min="0" max="0.08" step="0.005" value="0.03"> <b id="rideVal">-3 cm</b></label>
+  <div id="help"><kbd>L</kbd> faróis · <kbd>T</kbd> noite · <kbd>1</kbd>–<kbd>7</kbd> câmeras<br>segure <kbd>W</kbd>/<kbd>↑</kbd>/<kbd>espaço</kbd> para acelerar · <kbd>S</kbd>/<kbd>↓</kbd> freio · <kbd>N</kbd> ponto morto</div>
 </div>
+<script src="models/s15.glb.js"></script>
 <script src="audio/engine-samples.js"></script>
 <script src="audio/engine-v8.js"></script>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Reflector } from 'three/addons/objects/Reflector.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const Q = new URLSearchParams(location.search);
@@ -123,7 +135,7 @@ camera.position.set(5.9, 2.0, -5.6);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0.55, 0);
 controls.enableDamping = true;
-controls.minDistance = 2.2;
+controls.minDistance = 0.3;
 controls.maxDistance = 14;
 controls.maxPolarAngle = Math.PI / 2 - 0.03;
 controls.autoRotate = true;
@@ -860,7 +872,7 @@ for (const [x, track, front] of [[FRONT_AXLE, 0.738, true], [REAR_AXLE, 0.748, f
     w.rotation.y = front ? 0.16 : 0;
     w.rotation.x = -s * 0.03;   // a touch of negative camber
     car.add(w);
-    wheelSpins.push(w.userData.spin);
+    wheelSpins.push({ obj: w.userData.spin, axis: 'z', sign: -1 });
     // wheel-well liner
     const well = new THREE.Mesh(new THREE.CylinderGeometry(ARCH_R + 0.012, ARCH_R + 0.012, 0.46, 48, 1, false, Math.PI / 2 - 0.35, Math.PI + 0.7), new THREE.MeshStandardMaterial({ color: 0x070708, roughness: 1, side: THREE.BackSide }));
     well.rotation.x = Math.PI / 2; well.position.set(x, ARCH_Y, s * 0.6);
@@ -868,6 +880,75 @@ for (const [x, track, front] of [[FRONT_AXLE, 0.738, true], [REAR_AXLE, 0.748, f
   }
 
 car.traverse((o) => { if (o.isMesh && !o.material.transparent && o.material !== darkVoid) { o.castShadow = true; o.receiveShadow = true; } });
+
+// ================================================================ lamps
+const glowTexW = canvasTex(128, 128, (c) => { const g = c.createRadialGradient(64, 64, 0, 64, 64, 64); g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.25, 'rgba(255,255,255,0.55)'); g.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(0, 0, 128, 128); });
+function glowSprite(color, size) {
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexW, color, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, toneMapped: false, opacity: 0 }));
+  sp.scale.setScalar(size); sp.renderOrder = 9;
+  return sp;
+}
+const lamps = { ready: false, on: false, beams: [], headGlow: [], tailGlow: [], tailSpill: [] };
+
+// ================================================================ detailed model (glTF)
+// The hand-built car above is the fallback; when the downloaded S15 model is available it replaces it.
+// Add ?proc to the URL to see the procedural one.
+const FLAME_POS = V3(-2.27, 0.27, 0.45);
+if (window.S15_GLB && !Q.has('proc')) {
+  const bytes = Uint8Array.from(atob(window.S15_GLB), (c) => c.charCodeAt(0));
+  new GLTFLoader().parse(bytes.buffer, '', (gltf) => {
+    const model = gltf.scene;
+    model.rotation.y = Math.PI / 2;                         // model faces +z, the scene's car faces +x
+    model.updateMatrixWorld(true);
+    const raw = new THREE.Box3().setFromObject(model).getSize(V3());
+    model.scale.setScalar(4.445 / Math.max(raw.x, raw.z));  // the file's units are off by 100x: size it to a real S15 (4.445 m long)
+    model.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(model);
+    model.position.set(-(box.min.x + box.max.x) / 2, DROP - box.min.y, -(box.min.z + box.max.z) / 2);   // centred, tyres on the floor
+    for (const c of car.children) c.visible = false;        // hide the procedural car
+    car.add(model);
+    flame.visible = false;
+    const seen = new Set();
+    model.traverse((o) => {
+      if (!o.isMesh) return;
+      const m = o.material;
+      o.castShadow = !m.transparent; o.receiveShadow = !m.transparent;
+      if (seen.has(m)) return; seen.add(m);
+      if (m.transmission > 0) { m.transmission = 0; m.transparent = true; m.opacity = /Window/.test(m.name) ? 0.42 : 0.7; m.depthWrite = false; m.roughness = 0.03; m.envMapIntensity = 1.6; }
+      if (/Paint/.test(m.name)) { m.clearcoat = 1; m.clearcoatRoughness = 0.03; m.roughness = 0.35; m.metalness = 0.2; }
+      if (m.map) m.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    });
+    // wheels + brakes leave the body group so they stay planted while the body squats and dives
+    car.updateMatrixWorld(true);
+    const rolling = new THREE.Group(); scene.add(rolling);
+    const corners = [];
+    model.traverse((o) => { if (/^(3DWheel|Calliper)_(Front|Rear)_[LR]$/.test(o.name)) corners.push(o); });
+    wheelSpins.length = 0;
+    for (const o of corners) {
+      rolling.attach(o);
+      if (o.name.startsWith('3DWheel')) wheelSpins.push({ obj: o.children[0], axis: 'x', sign: o.name.endsWith('_L') ? 1 : -1 });
+    }
+    // model-space point (metres, +z = front, +x = left) -> the car group's space
+    const ref = model.getObjectByProperty('isMesh', true);
+    const P = (x, y, z) => car.worldToLocal(ref.localToWorld(V3(x, y, z)));
+    flame.position.copy(P(0.404, 0.262, -2.27));           // the model's tailpipe (left side)
+    for (const s of [1, -1]) {
+      // headlights: a real beam + a glow on the lens
+      const beam = new THREE.SpotLight(0xfff0d8, 0, 40, 0.5, 0.7, 1.6);
+      beam.position.copy(P(s * 0.55, 0.62, 2.02));
+      beam.target.position.copy(P(s * 0.5, 0.05, 9));
+      car.add(beam, beam.target);
+      const hg = glowSprite(0xfff4e0, 0.55); hg.position.copy(P(s * 0.55, 0.615, 2.1));
+      // tail lights: glow + a little red spill on the floor
+      const tg = glowSprite(0xff1a10, 0.5); tg.position.copy(P(s * 0.55, 0.765, -2.2));
+      const spill = new THREE.PointLight(0xff2010, 0, 3, 2); spill.position.copy(P(s * 0.55, 0.7, -2.4));
+      car.add(hg, tg, spill);
+      lamps.beams.push(beam); lamps.headGlow.push(hg); lamps.tailGlow.push(tg); lamps.tailSpill.push(spill);
+    }
+    lamps.ready = true;
+    window.__model = model;
+  }, (e) => console.error('S15 model', e));
+}
 
 // ================================================================ floor: mirror + white fade + shadows
 const mirror = new Reflector(new THREE.PlaneGeometry(40, 40), {
@@ -906,6 +987,58 @@ scene.add(catcher);
 
 // ================================================================ loop
 const rotBtn = document.getElementById('rot');
+// ---- lighting presets: bright studio / dark studio where the car's own lights do the work
+const nightFloor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshStandardMaterial({ color: 0x1b1c20, roughness: 0.5, metalness: 0.1, transparent: true, opacity: 0.8, depthWrite: false }));
+nightFloor.rotation.x = -Math.PI / 2; nightFloor.position.y = 0.0015; nightFloor.renderOrder = 1; nightFloor.receiveShadow = true; nightFloor.visible = false;
+scene.add(nightFloor);
+let night = false;
+function setNight(v) {
+  night = v;
+  scene.background.set(v ? 0x08090b : BG);
+  document.body.style.background = v ? '#08090b' : '#f3f3f5';
+  scene.environmentIntensity = v ? 0.22 : 1;
+  sun.intensity = v ? 0.35 : 1.1;
+  fade.visible = blob.visible = !v; nightFloor.visible = v;
+  mirror.material.uniforms.color.value.set(v ? 0x8a8a8a : 0xb8b8b8);
+  catcher.material.opacity = v ? 0.5 : 0.16;
+  $('nightBtn').textContent = v ? '☀ estúdio' : '🌙 noite';
+  $('hud').style.color = v ? '#aaa' : '#555';
+  if (v && !lamps.on) setLamps(true);
+}
+function setLamps(v) { lamps.on = v; $('lightBtn').style.background = v ? '#ffe9a8' : ''; }
+function stepLamps(dt) {
+  if (!lamps.ready) return;
+  const k = Math.min(1, dt * 10), on = lamps.on ? 1 : 0, brake = eng.brake && eng.on ? 1 : 0;
+  for (const b of lamps.beams) b.intensity += (on * (night ? 260 : 60) - b.intensity) * k;
+  for (const g of lamps.headGlow) g.material.opacity += (on * 0.95 - g.material.opacity) * k;
+  for (const g of lamps.tailGlow) { g.material.opacity += (Math.max(on * 0.4, brake) - g.material.opacity) * k; g.scale.setScalar(0.45 + 0.35 * brake); }
+  for (const p of lamps.tailSpill) p.intensity += ((on * 0.6 + brake * 3) - p.intensity) * k;
+}
+
+// ---- camera views
+const VIEWS = {
+  front: [[5.2, 1.6, -4.6], [0, 0.55, 0]], side: [[0, 0.9, -6.8], [0, 0.55, 0]], rear: [[-5.6, 1.5, 4.2], [0, 0.55, 0]],
+  exhaust: [[-4.6, 0.4, -1.9], [-1.6, 0.4, -0.3]], top: [[-0.4, 8.5, 0.01], [0, 0.3, 0]],
+  cockpit: [[-0.3, 1.06, 0.36], [0.5, 0.98, 0.36]], wheel: [[2.7, 0.45, -2.3], [1.25, 0.33, -0.7]],
+};
+let camGoal = null;
+function setView(name) {
+  const v = VIEWS[name]; if (!v) return;
+  camGoal = { pos: V3(...v[0]), tgt: V3(...v[1]) };
+  controls.autoRotate = false; rotBtn.textContent = '▶ girar';
+  $('viewSel').value = name;
+}
+function stepCamera(dt) {
+  if (!camGoal) return;
+  const k = 1 - Math.exp(-dt * 5);
+  camera.position.lerp(camGoal.pos, k); controls.target.lerp(camGoal.tgt, k);
+  if (camera.position.distanceTo(camGoal.pos) < 0.005) camGoal = null;
+}
+renderer.domElement.addEventListener('pointerdown', () => (camGoal = null));
+renderer.domElement.addEventListener('wheel', () => (camGoal = null), { passive: true });
+
+let bodyDrop = 0.03;   // extra lowering of the body over the wheels (the "altura" slider)
+
 rotBtn.onclick = () => {
   controls.autoRotate = !controls.autoRotate;
   rotBtn.textContent = controls.autoRotate ? '⏸ girar' : '▶ girar';
@@ -1088,7 +1221,7 @@ const flame = new THREE.Group();
   const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, toneMapped: false }));
   glow.scale.setScalar(0.55); glow.position.x = -0.12;
   flame.add(glow);
-  flame.position.set(-2.27, 0.27, 0.45);
+  flame.position.copy(FLAME_POS);
   flame.visible = false; flame.userData.t = 0;
   flame.traverse((o) => (o.renderOrder = 8));
   car.add(flame);
@@ -1177,12 +1310,19 @@ for (const [k, e] of Object.entries(window.ENGINES ?? {})) $('engSel').add(new O
 $('engSel').onchange = (e) => { audio?.loadEngine(e.target.value); e.target.blur(); };
 $('engBtn').onclick = () => (eng.on ? stopEngine() : startEngine());
 $('neutralBtn').onclick = toggleNeutral;
+$('lightBtn').onclick = () => setLamps(!lamps.on);
+$('nightBtn').onclick = () => setNight(!night);
+$('viewSel').onchange = (e) => { setView(e.target.value); e.target.blur(); };
+$('ride').oninput = (e) => { bodyDrop = +e.target.value; $('rideVal').textContent = '-' + Math.round(bodyDrop * 100) + ' cm'; };
 const GAS = ['KeyW', 'ArrowUp', 'Space'], BRAKE = ['KeyS', 'ArrowDown'];
 addEventListener('keydown', (e) => {
   if (e.repeat) { if ([...GAS, ...BRAKE].includes(e.code)) e.preventDefault(); return; }
   if (GAS.includes(e.code)) { e.preventDefault(); if (!eng.on) startEngine(); eng.gas = true; $('gasBtn').classList.add('on'); }
   else if (BRAKE.includes(e.code)) { e.preventDefault(); eng.brake = eng.on; $('brakeBtn').classList.toggle('on', eng.on); }
   else if (e.code === 'KeyN') toggleNeutral();
+  else if (e.code === 'KeyL') setLamps(!lamps.on);
+  else if (e.code === 'KeyT') setNight(!night);
+  else if (/^Digit[1-7]$/.test(e.code)) setView(Object.keys(VIEWS)[+e.code[5] - 1]);
 });
 addEventListener('keyup', (e) => {
   if (GAS.includes(e.code)) { eng.gas = false; $('gasBtn').classList.remove('on'); }
@@ -1196,13 +1336,14 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
   stepEngine(dt);
   stepFlame(dt);
-  for (const sp of wheelSpins) sp.rotation.z -= (eng.v / WHEEL_R) * dt;
+  for (const w of wheelSpins) w.obj.rotation[w.axis] += w.sign * (eng.v / WHEEL_R) * dt;
   // body reacts: squat under power, dive on brakes, idle shake
   shake += dt * (eng.rpm / 60) * Math.PI * 2;
   const vib = eng.on ? 0.0012 * (1 - 0.7 * clamp(eng.rpm / 4000, 0, 1)) : 0;
   car.rotation.z += (clamp(eng.accel, -10, 8) * 0.0022 - car.rotation.z) * Math.min(1, dt * 8);
   car.rotation.x = Math.sin(shake * 0.5) * vib;
-  car.position.y = -DROP + Math.sin(shake) * vib * 0.4;
+  car.position.y = -DROP - bodyDrop + Math.sin(shake) * vib * 0.4;
+  stepLamps(dt); stepCamera(dt);
   $('tachFill').style.width = clamp(eng.rpm / MAXRPM, 0, 1) * 100 + '%';
   $('rpm').textContent = Math.round(eng.rpm / 10) * 10;
   $('gear').textContent = !eng.on ? '–' : eng.neutral ? 'N' : eng.gear;
