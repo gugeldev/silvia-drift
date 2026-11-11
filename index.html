@@ -79,6 +79,10 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Reflector } from 'three/addons/objects/Reflector.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const Q = new URLSearchParams(location.search);
@@ -882,13 +886,42 @@ for (const [x, track, front] of [[FRONT_AXLE, 0.738, true], [REAR_AXLE, 0.748, f
 car.traverse((o) => { if (o.isMesh && !o.material.transparent && o.material !== darkVoid) { o.castShadow = true; o.receiveShadow = true; } });
 
 // ================================================================ lamps
-const glowTexW = canvasTex(128, 128, (c) => { const g = c.createRadialGradient(64, 64, 0, 64, 64, 64); g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.25, 'rgba(255,255,255,0.55)'); g.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(0, 0, 128, 128); });
-function glowSprite(color, size) {
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexW, color, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, toneMapped: false, opacity: 0 }));
-  sp.scale.setScalar(size); sp.renderOrder = 9;
+const glowTexW = canvasTex(128, 128, (c) => { const g = c.createRadialGradient(64, 64, 0, 64, 64, 64); g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.15, 'rgba(255,255,255,0.5)'); g.addColorStop(0.45, 'rgba(255,255,255,0.1)'); g.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(0, 0, 128, 128); });
+function glowSprite(rgb, size) {
+  // drawn on top of the bodywork (no depth test) and faded by viewing angle in stepLamps, so it never floats or
+  // gets buried in the housing; the colour is brighter than white so the bloom pass turns it into a real glare
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexW, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, transparent: true, opacity: 0 }));
+  sp.material.color.setRGB(...rgb);
+  sp.scale.setScalar(size); sp.renderOrder = 20; sp.userData.size = size;
   return sp;
 }
-const lamps = { ready: false, on: false, beams: [], headGlow: [], tailGlow: [], tailSpill: [] };
+// fake volumetric beam: a soft additive cone from the lamp
+const beamTex = canvasTex(8, 256, (c) => { const g = c.createLinearGradient(0, 0, 0, 256); g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.04, 'rgba(255,255,255,0.5)'); g.addColorStop(0.3, 'rgba(255,255,255,0.14)'); g.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(0, 0, 8, 256); });
+function beamCone(from, to) {
+  const len = 6.5, geo = new THREE.ConeGeometry(1.25, len, 40, 1, true);
+  geo.translate(0, -len / 2, 0);   // apex at the lamp
+  // soft volumetric look: brightness falls off along the beam AND towards the silhouette of the cone, so there
+  // is no hard outline from any angle
+  const m = new THREE.Mesh(geo, new THREE.ShaderMaterial({
+    uniforms: { opacity: { value: 0 }, color: { value: new THREE.Color(0xfff1dc) } },
+    vertexShader: `varying vec3 vN; varying vec3 vV; varying float vT;
+      void main() { vec4 mv = modelViewMatrix * vec4(position, 1.0); vN = normalMatrix * normal; vV = -mv.xyz; vT = 1.0 - uv.y; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: `uniform float opacity; uniform vec3 color; varying vec3 vN; varying vec3 vV; varying float vT;
+      void main() {
+        vec3 n = vN / max(length(vN), 1e-5), v = vV / max(length(vV), 1e-5);
+        float edge = pow(clamp(abs(dot(n, v)), 0.0, 1.0), 2.5);
+        float t = clamp(vT, 0.0, 1.0);
+        float along = smoothstep(0.0, 0.05, t) * pow(1.0 - t, 2.4);
+        gl_FragColor = vec4(max(color * edge * along * opacity, vec3(0.0)), 1.0);
+      }`,
+    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+  }));
+  m.position.copy(from);
+  m.quaternion.setFromUnitVectors(V3(0, -1, 0), to.clone().sub(from).normalize());
+  m.renderOrder = 15;
+  return m;
+}
+const lamps = { ready: false, on: false, beams: [], cones: [], headGlow: [], tailGlow: [], tailSpill: [] };
 
 // ================================================================ detailed model (glTF)
 // The hand-built car above is the fallback; when the downloaded S15 model is available it replaces it.
@@ -915,7 +948,9 @@ if (window.S15_GLB && !Q.has('proc')) {
       o.castShadow = !m.transparent; o.receiveShadow = !m.transparent;
       if (seen.has(m)) return; seen.add(m);
       if (m.transmission > 0) { m.transmission = 0; m.transparent = true; m.opacity = /Window/.test(m.name) ? 0.42 : 0.7; m.depthWrite = false; m.roughness = 0.03; m.envMapIntensity = 1.6; }
-      if (/Paint/.test(m.name)) { m.clearcoat = 1; m.clearcoatRoughness = 0.03; m.roughness = 0.35; m.metalness = 0.2; }
+      if (/Paint/.test(m.name)) { m.clearcoat = 1; m.clearcoatRoughness = 0.07; m.roughness = 0.35; m.metalness = 0.2; }
+      // the lamp units light up themselves (their own texture glows), the sprites only add a little bloom
+      if (m.name === 'red_glass') { m.emissive.set(0xff1408); m.emissiveIntensity = 0; lamps.redMat = m; }
       if (m.map) m.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
     });
     // wheels + brakes leave the body group so they stay planted while the body squats and dives
@@ -935,14 +970,20 @@ if (window.S15_GLB && !Q.has('proc')) {
     for (const s of [1, -1]) {
       // headlights: a real beam + a glow on the lens
       const beam = new THREE.SpotLight(0xfff0d8, 0, 40, 0.5, 0.7, 1.6);
-      beam.position.copy(P(s * 0.55, 0.62, 2.02));
+      beam.position.copy(P(s * 0.55, 0.6, 2.32));   // just ahead of the bumper: inside the housing it lit surfaces from millimetres away and overflowed the HDR buffer
       beam.target.position.copy(P(s * 0.5, 0.05, 9));
       car.add(beam, beam.target);
-      const hg = glowSprite(0xfff4e0, 0.55); hg.position.copy(P(s * 0.55, 0.615, 2.1));
+      const cone = beamCone(P(s * 0.55, 0.61, 2.05), P(s * 0.6, 0.25, 9)); car.add(cone); lamps.cones.push(cone);
+      const hg = glowSprite([2.6, 2.4, 2.0], 0.16); hg.userData.side = s; hg.position.copy(P(s * 0.47, 0.61, 1.97));       // inner projector
+      const hg2 = glowSprite([2.0, 1.85, 1.55], 0.13); hg2.userData.side = s; hg2.position.copy(P(s * 0.64, 0.615, 1.88)); car.add(hg2); lamps.headGlow.push(hg2);   // outer lamp
       // tail lights: glow + a little red spill on the floor
-      const tg = glowSprite(0xff1a10, 0.5); tg.position.copy(P(s * 0.55, 0.765, -2.2));
-      const spill = new THREE.PointLight(0xff2010, 0, 3, 2); spill.position.copy(P(s * 0.55, 0.7, -2.4));
-      car.add(hg, tg, spill);
+      const tg = glowSprite([2.2, 0.12, 0.06], 0.17); tg.userData.side = s; tg.position.copy(P(s * 0.56, 0.78, -2.15));
+      // red wash on the floor behind each lamp. A painted glow, not a real light: a point light there showed up
+      // as a hard little highlight mirrored in the glossy bumper
+      const spill = new THREE.Mesh(new THREE.CircleGeometry(1.0, 32), new THREE.MeshBasicMaterial({ map: glowTexW, color: 0xff1a08, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
+      spill.rotation.x = -Math.PI / 2; spill.position.set(-2.75, 0.004, -s * 0.5); spill.renderOrder = 4;
+      scene.add(spill);
+      car.add(hg, tg);
       lamps.beams.push(beam); lamps.headGlow.push(hg); lamps.tailGlow.push(tg); lamps.tailSpill.push(spill);
     }
     lamps.ready = true;
@@ -987,17 +1028,30 @@ scene.add(catcher);
 
 // ================================================================ loop
 const rotBtn = document.getElementById('rot');
+// ---- post-processing: bloom, so anything brighter than white (lamps, flame, hot reflections) actually glares
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 4 }));
+composer.setPixelRatio(renderer.getPixelRatio());
+composer.setSize(innerWidth, innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.18, 0.4, 1.15);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
 // ---- lighting presets: bright studio / dark studio where the car's own lights do the work
 const nightFloor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshStandardMaterial({ color: 0x1b1c20, roughness: 0.5, metalness: 0.1, transparent: true, opacity: 0.8, depthWrite: false }));
 nightFloor.rotation.x = -Math.PI / 2; nightFloor.position.y = 0.0015; nightFloor.renderOrder = 1; nightFloor.receiveShadow = true; nightFloor.visible = false;
 scene.add(nightFloor);
+const nightFill = new THREE.HemisphereLight(0x9fb0d0, 0x15151a, 0);   // soft, highlight-free fill for the dark studio
+scene.add(nightFill);
 let night = false;
 function setNight(v) {
   night = v;
   scene.background.set(v ? 0x08090b : BG);
   document.body.style.background = v ? '#08090b' : '#f3f3f5';
   scene.environmentIntensity = v ? 0.22 : 1;
-  sun.intensity = v ? 0.35 : 1.1;
+  bloom.strength = v ? 0.45 : 0.14; bloom.radius = v ? 0.5 : 0.4; bloom.threshold = v ? 0.9 : 1.15;
+  sun.intensity = v ? 0 : 1.1;        // no key light at night: its pinpoint reflections in the clearcoat bloomed into stray glare
+  nightFill.intensity = v ? 0.45 : 0;
   fade.visible = blob.visible = !v; nightFloor.visible = v;
   mirror.material.uniforms.color.value.set(v ? 0x8a8a8a : 0xb8b8b8);
   catcher.material.opacity = v ? 0.5 : 0.16;
@@ -1009,10 +1063,20 @@ function setLamps(v) { lamps.on = v; $('lightBtn').style.background = v ? '#ffe9
 function stepLamps(dt) {
   if (!lamps.ready) return;
   const k = Math.min(1, dt * 10), on = lamps.on ? 1 : 0, brake = eng.brake && eng.on ? 1 : 0;
-  for (const b of lamps.beams) b.intensity += (on * (night ? 260 : 60) - b.intensity) * k;
-  for (const g of lamps.headGlow) g.material.opacity += (on * 0.95 - g.material.opacity) * k;
-  for (const g of lamps.tailGlow) { g.material.opacity += (Math.max(on * 0.4, brake) - g.material.opacity) * k; g.scale.setScalar(0.45 + 0.35 * brake); }
-  for (const p of lamps.tailSpill) p.intensity += ((on * 0.6 + brake * 3) - p.intensity) * k;
+  // how squarely the camera faces the front / the back of the car
+  const dir = camera.position.clone().sub(car.position).normalize();
+  // each lamp faces forward (or back) and a little outward: it fades as you move round to the side and is
+  // off entirely for the lamp on the far side of the car, so nothing shines through the bodywork
+  const facing = (g, fwd) => clamp((dir.x * fwd * 0.87 - dir.z * g.userData.side * 0.5) * 1.7 - 0.35, 0, 1);
+  lamps.level = (lamps.level ?? 0) + (on - (lamps.level ?? 0)) * k;
+  lamps.brake = (lamps.brake ?? 0) + (brake - (lamps.brake ?? 0)) * k;
+  const L = lamps.level, B = lamps.brake;
+  for (const b of lamps.beams) b.intensity = L * (night ? 320 : 70);
+  for (const c of lamps.cones) c.material.uniforms.opacity.value = L * (night ? 0.55 : 0.06);
+  for (const g of lamps.headGlow) { const f = facing(g, 1); g.material.opacity = L * f; g.scale.setScalar(g.userData.size * (0.6 + 0.6 * f)); }
+  for (const g of lamps.tailGlow) { g.material.opacity = Math.max(L * 0.35, B) * facing(g, -1); g.scale.setScalar(g.userData.size * (1 + 0.5 * B)); }
+  for (const p of lamps.tailSpill) p.material.opacity = L * 0.1 + B * 0.4;
+  if (lamps.redMat) lamps.redMat.emissiveIntensity = L * 0.8 + B * 2.2;
 }
 
 // ---- camera views
@@ -1049,6 +1113,7 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
   mirror.getRenderTarget().setSize(innerWidth * renderer.getPixelRatio(), innerHeight * renderer.getPixelRatio());
 });
 
@@ -1205,40 +1270,86 @@ function toggleNeutral() {
 const rpmAt = (v, gear) => (v / (2 * Math.PI * WHEEL_R)) * 60 * RATIOS[gear - 1] * FINAL;
 const torque = (rpm) => 0.55 + 0.45 * Math.sin(Math.PI * clamp((rpm - 1200) / 7600, 0, 1));
 
-// exhaust flame: shot out of the tailpipe on every backfire
+// exhaust flame: shot out of the tailpipe on every backfire. Crossed planes with a procedural fire shader
+// (scrolling turbulence, hot blue-white core at the pipe, yellow body, orange-red ragged tip).
 const flame = new THREE.Group();
+const flameU = { time: { value: 0 }, life: { value: 0 }, seed: { value: 0 }, side: { value: 1 } };
 {
-  const mk = (pts, color, opacity) => {
-    const m = new THREE.Mesh(new THREE.LatheGeometry(pts.map(([r, y]) => new THREE.Vector2(r, y)), 20),
-      new THREE.MeshBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, toneMapped: false }));
-    m.rotation.z = Math.PI / 2;   // +y of the profile -> out the back of the car
-    return m;
-  };
-  flame.add(mk([[0.001, 0], [0.04, 0.03], [0.062, 0.12], [0.05, 0.24], [0.022, 0.36], [0.001, 0.46]], 0xff5a10, 0.75));
-  flame.add(mk([[0.001, 0], [0.028, 0.03], [0.038, 0.1], [0.022, 0.2], [0.001, 0.28]], 0xffd070, 0.9));
-  flame.add(mk([[0.001, 0], [0.018, 0.02], [0.02, 0.07], [0.001, 0.13]], 0xbfd8ff, 1));
-  const glowTex = canvasTex(128, 128, (c) => { const g = c.createRadialGradient(64, 64, 0, 64, 64, 64); g.addColorStop(0, 'rgba(255,190,90,1)'); g.addColorStop(0.4, 'rgba(255,110,20,0.45)'); g.addColorStop(1, 'rgba(255,80,0,0)'); c.fillStyle = g; c.fillRect(0, 0, 128, 128); });
-  const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, toneMapped: false }));
-  glow.scale.setScalar(0.55); glow.position.x = -0.12;
-  flame.add(glow);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: flameU,
+    vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: `uniform float time, life, seed, side; varying vec2 vUv;
+      float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float noise(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y); }
+      float fbm(vec2 p) { float a = 0.5, s = 0.0; for (int k = 0; k < 4; k++) { s += a * noise(p); p *= 2.1; a *= 0.5; } return s; }
+      void main() {
+        float x = 1.0 - vUv.x;                 // 0 at the pipe, 1 at the tip
+        float y = vUv.y * 2.0 - 1.0;
+        float reach = 0.35 + 0.65 * life;      // the jet retracts as it dies
+        float t = x / reach;
+        float n = fbm(vec2(x * 4.0 - time * 14.0, y * 2.5 + seed * 17.0));
+        float n2 = fbm(vec2(x * 9.0 - time * 22.0, y * 6.0 - seed * 5.0));
+        float width = mix(0.16, 0.62, smoothstep(0.0, 0.3, t)) * (1.0 - 0.75 * t * t) * (0.6 + 0.8 * n);
+        float d = abs(y + (n2 - 0.5) * 0.35 * t) / max(width, 0.001);
+        float body = (1.0 - smoothstep(0.15, 1.0, d)) * (1.0 - smoothstep(0.75, 1.0, t)) * smoothstep(0.0, 0.03, x);
+        body *= 0.55 + 0.9 * n2;               // licks and holes
+        float heat = body * (1.0 - 0.7 * t) * (0.5 + 0.5 * life);
+        vec3 col = mix(vec3(0.9, 0.12, 0.01), vec3(1.0, 0.45, 0.05), smoothstep(0.1, 0.4, heat));
+        col = mix(col, vec3(1.0, 0.85, 0.4), smoothstep(0.4, 0.7, heat));
+        col = mix(col, vec3(0.75, 0.85, 1.0), smoothstep(0.75, 1.0, heat) * (1.0 - smoothstep(0.0, 0.35, t)));
+        gl_FragColor = vec4(clamp(col * body * (0.9 + 1.3 * heat) * smoothstep(0.0, 0.15, life) * side, 0.0, 2.2), 1.0);   // kept modest: very bright pixels make the bloom show its square blur footprint
+      }`,
+    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+  });
+  const geo = new THREE.PlaneGeometry(1, 0.5);
+  geo.translate(-0.5, 0, 0);                   // starts at the pipe, extends out the back (-x)
+  for (let k = 0; k < 3; k++) { const m = new THREE.Mesh(geo, mat); m.rotation.x = (k * Math.PI) / 3; flame.add(m); }
+  const glowTex = canvasTex(128, 128, (c) => { const g = c.createRadialGradient(64, 64, 0, 64, 64, 64); g.addColorStop(0, 'rgba(255,190,90,1)'); g.addColorStop(0.4, 'rgba(255,110,20,0.4)'); g.addColorStop(1, 'rgba(255,80,0,0)'); c.fillStyle = g; c.fillRect(0, 0, 128, 128); });
+  const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
+  glow.material.color.setRGB(0.9, 0.8, 0.7); glow.scale.setScalar(0.3); glow.position.x = -0.06;
+  flame.add(glow); flame.userData.glow = glow;
+  // seen end-on, crossed planes read as a star: they fade out and this round, flickering fireball takes over
+  const ballTex = canvasTex(128, 128, (c) => {
+    const g = c.createRadialGradient(64, 64, 0, 64, 64, 62);
+    g.addColorStop(0, 'rgba(225,235,255,1)'); g.addColorStop(0.16, 'rgba(255,225,130,0.95)'); g.addColorStop(0.42, 'rgba(255,120,20,0.55)'); g.addColorStop(0.75, 'rgba(220,40,0,0.15)'); g.addColorStop(1, 'rgba(200,30,0,0)');
+    c.fillStyle = g; c.fillRect(0, 0, 128, 128);
+  });
+  const ball = new THREE.Sprite(new THREE.SpriteMaterial({ map: ballTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0 }));
+  ball.position.x = -0.1; flame.add(ball); flame.userData.ball = ball;
+  // warm flash on the floor under the pipe
+  const wash = new THREE.Mesh(new THREE.CircleGeometry(1.3, 32), new THREE.MeshBasicMaterial({ map: glowTex, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
+  wash.rotation.x = -Math.PI / 2; wash.renderOrder = 4; scene.add(wash); flame.userData.wash = wash;
   flame.position.copy(FLAME_POS);
-  flame.visible = false; flame.userData.t = 0;
-  flame.traverse((o) => (o.renderOrder = 8));
+  flame.visible = false; flame.userData.t = 0; flame.userData.len = 1;
+  flame.traverse((o) => (o.renderOrder = 18));
   car.add(flame);
 }
 function backfire(level = 1, when = 0) {
   audio.pop(when, level);
   if (level < 0.4) return;   // only the real bangs spit fire
   setTimeout(() => {
-    flame.userData.t = 1; flame.userData.len = 0.5 + 0.9 * level * (0.6 + 0.4 * Math.random());
+    const u = flame.userData;
+    u.t = 1; u.len = 0.45 + 0.75 * level * (0.6 + 0.4 * Math.random());
+    flameU.seed.value = Math.random();
     flame.rotation.x = Math.random() * 6.28;
   }, when * 1000);
 }
 function stepFlame(dt) {
   const u = flame.userData;
-  u.t = Math.max(0, u.t - dt / 0.1);
+  u.t = Math.max(0, u.t - dt / 0.17);
+  flameU.time.value += dt; flameU.life.value = u.t;
   flame.visible = u.t > 0;
-  if (flame.visible) { const w = 0.55 + 0.6 * u.t; flame.scale.set(u.len * (0.5 + 0.5 * u.t), w, w); }
+  u.wash.material.opacity = 0.22 * u.t * u.t;
+  if (!flame.visible) return;
+  flame.scale.set(u.len, 0.7 + 0.5 * u.len, 0.7 + 0.5 * u.len);
+  u.glow.material.opacity = 0.6 * u.t;
+  const endOn = smooth(0.55, 0.92, Math.abs(camera.position.clone().sub(flame.getWorldPosition(V3())).normalize().x));   // 1 = looking straight down the pipe
+  flameU.side.value = 1 - endOn;
+  u.ball.material.opacity = endOn * u.t * 1.3;
+  u.ball.material.rotation = Math.random() * 6.28;
+  u.ball.scale.set((0.28 + 0.14 * Math.random()) / flame.scale.x, (0.28 + 0.14 * Math.random()) / flame.scale.y, 1).multiplyScalar(0.5 + 0.5 * u.t);
+  flame.getWorldPosition(u.wash.position); u.wash.position.y = 0.005; u.wash.position.x -= 0.5;
 }
 
 function stepEngine(dt) {
@@ -1349,7 +1460,7 @@ renderer.setAnimationLoop(() => {
   $('gear').textContent = !eng.on ? '–' : eng.neutral ? 'N' : eng.gear;
   $('kmh').textContent = Math.round(eng.v * 3.6);
   controls.update();
-  renderer.render(scene, camera);
+  if (Q.has('nobloom')) renderer.render(scene, camera); else composer.render();
 });
 
 if (Q.has('rev')) {   // self-test: steps the simulation with a fixed timestep and logs what happened
